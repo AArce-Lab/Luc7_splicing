@@ -1,0 +1,763 @@
+Load Required Packages
+```{r}
+library("ggplot2")
+library("DESeq2")
+library("gridExtra")
+library("ggforce")
+library("Biostrings")
+library("biomartr")
+library("BSgenome.Scerevisiae.UCSC.sacCer3")
+library("ggseqlogo")
+library("RColorBrewer")
+```
+
+Read in data
+```{r}
+#Read in counts data
+All <- readRDS("./Data/All_Counts.RDS")
+Spliced <- readRDS("./Data/SplicedCounts")
+Unspliced <- readRDS("./Data/UnsplicedCounts")
+
+#Read in Ares intron data
+AresIntrons <- read.delim("./AnnotationFiles/rmMito_ordered_sc3intronsfeb15.saf")
+AresSeq <- read.delim(file = "./AnnotationFiles/outputfile.tsv")
+
+#Read in gene annoation 
+	
+mRNAGFF <-
+	readGFF(filepath = "./AnnotationFiles/saccharomyces_cerevisiae.20230412.gtf", filter = list(
+		type = c("mRNA"),
+		seqid = c(
+			"chrI",
+			"chrII",
+			"chrIII",
+			"chrIV",
+			"chrV",
+			"chrVI",
+			"chrVII",
+			"chrVIII",
+			"chrIX",
+			"chrX",
+			"chrXI",
+			"chrXII",
+			"chrXIII",
+			"chrXIV",
+			"chrXV",
+			"chrXVI"
+		)
+	))
+
+#Set genome style
+seqlevelsStyle(BSgenome.Scerevisiae.UCSC.sacCer3) <- "NCBI"
+```
+
+Process Data
+```{r}
+#Extract counts dataframe from RDS
+SplicedDF <- Spliced$counts
+UnsplicedDF <- Unspliced$counts
+
+# Define a function to calculate the mean of two columns
+calculate_mean <- function(data, col1, col2) {
+  return ((data[[col1]] + data[[col2]]) / 2)
+}
+
+# Define a function to calculate the ratio of two columns
+calculate_ratio <- function(data, numerator, denominator) {
+  return (data[[numerator]] / data[[denominator]])
+}
+
+#Define A substring right function
+substrRight <- function(x, n){
+  substr(x, nchar(x)-n+1, nchar(x))
+}
+
+#Define a function to get inton length
+getIntronLength <- function(rowname) {
+Start <- as.numeric(strsplit(rowname, split = "_")[[1]][3])
+End <- as.numeric(strsplit(rowname, split = "_")[[1]][4])
+IntronLength <- End - Start
+return(IntronLength)
+}
+
+#Define A function to get the 5'ss and 3'ss
+GetFiveThreeSS <- function(GeneIDrow, upStreamBases = 0, downStreamBases = 2, downstreamFiveSSBases = 1) {
+chro <- AresIntrons[match(GeneIDrow, AresIntrons$GeneID),"Chr"]
+startpos <- AresIntrons[match(GeneIDrow, AresIntrons$GeneID),"Start"] + 1 
+endpos <- AresIntrons[match(GeneIDrow, AresIntrons$GeneID),"End"]
+strandpos <- AresIntrons[match(GeneIDrow, AresIntrons$GeneID),"Strand"]
+
+IntronGRange <- GRanges(
+    seqnames = chro,
+    ranges = IRanges(startpos, end = endpos, names = chro),
+    strand = strandpos
+    )
+
+IntronGRangeUS <- flank(IntronGRange, upStreamBases)
+IntronGRangeDS <- flank(IntronGRange, width = downStreamBases, start = FALSE)
+
+IntronSeq <- getSeq(x = BSgenome.Scerevisiae.UCSC.sacCer3, names = IntronGRange)
+USIntronSeq <- getSeq(x = BSgenome.Scerevisiae.UCSC.sacCer3, names = IntronGRangeUS)
+DSIntronSeq <- getSeq(x = BSgenome.Scerevisiae.UCSC.sacCer3, names = IntronGRangeDS)
+
+FiveSSseq <- substr(as.character(IntronSeq), 1, 6)
+DSFiveSSseq <- substr(as.character(IntronSeq), 7, 6 + downstreamFiveSSBases)
+USFiveSSseq <- as.character(USIntronSeq)
+DSIntronseq <- as.character(DSIntronSeq)
+ThreeSSseq <- substrRight(as.character(IntronSeq), 6)
+ThreeSSDSseq <- paste(ThreeSSseq,DSIntronseq, sep = "")
+
+ExtendedFiveSSseq <- paste(USFiveSSseq, FiveSSseq, DSFiveSSseq, sep = "")
+
+ssseq <- data.frame(USfiveSSseq = USFiveSSseq, fiveSSseq = FiveSSseq, DSFiveSSseq = DSFiveSSseq, ExtFiveSSseq = ExtendedFiveSSseq,threeSSseqExt = ThreeSSDSseq, threeSSseq = ThreeSSseq)
+
+return(ssseq)
+}
+
+# Define a function to get the TSS to 5'ss distance
+getCapToFivessDistance <- function(pairs, overlaps = overlapIntrons) {
+	intronstrand <- as.character(strand(overlaps@first[pairs]))
+	IntronID <- overlaps@first[pairs]$GeneID
+	if (intronstrand == "+") {
+		fivess <- start(overlaps@first[pairs])
+		tss <- start(overlaps@second[pairs])
+		captofivessdis <- fivess - tss
+	} else if (intronstrand == "-") {
+		fivess <- end(overlaps@first[pairs])
+		tss <- end(overlaps@second[pairs])
+		captofivessdis <- tss - fivess
+	}
+	return(captofivessdis)
+}
+
+GetCapFiveSSforSplicingData <- function(rowNumber) {
+NameIntron <- rownames(logoDF)[rowNumber]
+if (sum(CapToFiveSSdf$Intron %in% NameIntron)>1) {
+	Distances <- CapToFiveSSdf[CapToFiveSSdf$Intron == NameIntron, "Captofivess"]
+	Distances <- Distances[Distances>0]
+	return(min(Distances))
+}
+rowtarg <- match(NameIntron, CapToFiveSSdf$Intron, nomatch = NA)
+if (is.na(rowtarg)) {
+	return(NA)
+}
+CapDis <- CapToFiveSSdf$Captofivess[rowtarg]
+return(CapDis)
+}
+
+# Define a function to do a sliding window t-test
+ttest_scan_intron <- function(length, data, variable_ttest, ttestoutput = TRUE) {
+  longintron <- data[data$IntronLength > length,]
+  shortintron <- data[data$IntronLength < length,]
+	if (length(na.omit(longintron$IntronLength)) < 5 | length(na.omit(shortintron$IntronLength)) < 5) {
+		return(NA)
+	}
+  
+  shortValues <- shortintron[is.finite(log2(shortintron[[variable_ttest]])), variable_ttest]
+  longValues <- longintron[is.finite(log2(longintron[[variable_ttest]])), variable_ttest]
+  
+  ttest_result <- t.test(x = log2(shortValues), y = log2(longValues))
+  if (ttestoutput) {
+  	return(ttest_result$p.value)
+  } else {
+  	return(length(na.omit(longintron$IntronLength)))
+  }
+  
+}
+
+# Create column names for the Spliced and Unspliced data
+spliced_cols <- c("WT_1", "WT_2", "WT_3", "N31_1", "N31_2", "N31_3", "ZNF2_1", "ZNF2_2", "ZNF2_3")
+unspliced_cols <- paste(spliced_cols, c("L.Unspliced", "R.Unspliced"), sep = ".")
+
+# Create column names for Spliced and Unspliced mean and ratio columns
+spliced_mean_cols <- paste(spliced_cols, "Spliced", sep = "_")
+unspliced_mean_cols <- paste(spliced_cols, "Unspliced", sep = "_")
+un_over_spliced_cols <- paste(spliced_cols, "UnOverSpliced", sep = ".")
+
+#Create FullDF
+
+NumberOfIntronAnnotations <- nrow(SplicedDF)/2
+
+Fulldf <- data.frame("WT_1.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,1],
+					 "WT_1.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations + 1):nrow(SplicedDF),1],
+					 "WT_1.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,1],
+					 "WT_1.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),1],
+					 "WT_2.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,2],
+					 "WT_2.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),2],
+					 "WT_2.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,2],
+					 "WT_2.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),2],
+					 "WT_3.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,3],
+					 "WT_3.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),3],
+					 "WT_3.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,3],
+					 "WT_3.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),3],
+					 "N31_1.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,4],
+					 "N31_1.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),4],
+					 "N31_1.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,4],
+					 "N31_1.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),4],
+					 "N31_2.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,5],
+					 "N31_2.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),5],
+					 "N31_2.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,5],
+					 "N31_2.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),5],
+					 "N31_3.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,6],
+					 "N31_3.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),6],
+					 "N31_3.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,6],
+					 "N31_3.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),6],					 
+					 "ZNF2_1.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,7],
+					 "ZNF2_1.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),7],
+					 "ZNF2_1.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,7],
+					 "ZNF2_1.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),7],
+					 "ZNF2_2.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,8],
+					 "ZNF2_2.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),8],
+					 "ZNF2_2.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,8],
+					 "ZNF2_2.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),8],
+					 "ZNF2_3.L.Spliced" =SplicedDF[1:NumberOfIntronAnnotations,9],
+					 "ZNF2_3.R.Spliced" =SplicedDF[(NumberOfIntronAnnotations +1):nrow(SplicedDF),9],
+					 "ZNF2_3.L.Unspliced" = UnsplicedDF[1:NumberOfIntronAnnotations,9],
+					 "ZNF2_3.R.Unspliced" = UnsplicedDF[(NumberOfIntronAnnotations + 1):nrow(SplicedDF),9]
+					 )
+
+rownames(Fulldf) <- sapply(strsplit(rownames(Fulldf),"\\."), `[`, 1)
+Fulldf$GeneNames <- sapply(strsplit(rownames(Fulldf),"_"), `[`, 1)
+
+# Calculate the mean values for left and right Spliced and Unspliced
+for (i in 1:length(spliced_cols)) {
+  Fulldf[[spliced_mean_cols[i]]] <- calculate_mean(Fulldf, paste(spliced_cols[i], "L.Spliced", sep = "."), paste(spliced_cols[i], "R.Spliced", sep = "."))
+  Fulldf[[unspliced_mean_cols[i]]] <- calculate_mean(Fulldf, paste(spliced_cols[i], "L.Unspliced", sep = "."), paste(spliced_cols[i], "R.Unspliced", sep = "."))
+}
+
+# Calculate the UnOverSpliced ratios
+for (i in 1:length(spliced_cols)) {
+  Fulldf[[un_over_spliced_cols[i]]] <- calculate_ratio(Fulldf, unspliced_mean_cols[i], spliced_mean_cols[i])
+}
+
+# Log2 transform UnOverSpliced ratios
+WT_log_df <- data.frame(WT_1.UnOverSpliced= log2(Fulldf$WT_1.UnOverSpliced), WT_2.UnOverSpliced = log2(Fulldf$WT_2.UnOverSpliced), WT_3.UnOverSpliced = log2(Fulldf$WT_3.UnOverSpliced))
+N31_log_df <- data.frame(N31_1.UnOverSpliced= log2(Fulldf$N31_1.UnOverSpliced), N31_2.UnOverSpliced = log2(Fulldf$N31_2.UnOverSpliced), N31_3.UnOverSpliced = log2(Fulldf$N31_3.UnOverSpliced))
+ZNF2_log_df <- data.frame(ZNF2_1.UnOverSpliced= log2(Fulldf$ZNF2_1.UnOverSpliced), ZNF2_2.UnOverSpliced = log2(Fulldf$ZNF2_2.UnOverSpliced), ZNF2_3.UnOverSpliced = log2(Fulldf$ZNF2_3.UnOverSpliced))
+
+
+# Calculate mean of log2 transformation and then reverse the log transformation
+Fulldf$WT_Avg <- 2^apply(WT_log_df[c("WT_1.UnOverSpliced", "WT_2.UnOverSpliced", "WT_3.UnOverSpliced")],1, mean)
+Fulldf$N31_Avg <- 2^apply(N31_log_df[c("N31_1.UnOverSpliced", "N31_2.UnOverSpliced", "N31_3.UnOverSpliced")],1, mean)
+Fulldf$ZNF2_Avg <- 2^apply(ZNF2_log_df[c("ZNF2_1.UnOverSpliced", "ZNF2_2.UnOverSpliced", "ZNF2_3.UnOverSpliced")],1, mean)
+
+# Calculate mutant over WT
+Fulldf$N31_Over_WT <- Fulldf$N31_Avg/Fulldf$WT_Avg
+Fulldf$ZNF2_Over_WT <- Fulldf$ZNF2_Avg/Fulldf$WT_Avg
+
+#Calculate p-values
+Fulldf$pval_N31 <- apply(Fulldf, 1, function(row) {
+  WTVec <- as.numeric(row[c("WT_1.UnOverSpliced", "WT_2.UnOverSpliced", "WT_3.UnOverSpliced")])
+  WTVec <- sapply(WTVec, log2)
+  N31Vec <- as.numeric(row[c("N31_1.UnOverSpliced", "N31_2.UnOverSpliced", "N31_3.UnOverSpliced")])
+  N31Vec <- sapply(N31Vec, log2)
+  if (sum(is.finite(WTVec)) > 2 & sum(is.finite(N31Vec)) > 2) {
+    tryCatch({
+      tTestResult <- t.test(x = WTVec, y = N31Vec, na.action = NA)
+      if (!is.na(tTestResult$p.value)) {
+        return(tTestResult$p.value)
+      } else {
+        cat("NA p-value for row:\n", row, "\n")
+        return(NA)
+      }
+    }, error = function(e) {
+      cat("Error for row:\n", row, "\n")
+      return(NA)
+    })
+  } else {
+    return(NA)
+  }
+})
+
+
+Fulldf$pval_ZNF2 <- apply(Fulldf, 1, function(row) {
+  WTVec <- as.numeric(row[c("WT_1.UnOverSpliced", "WT_2.UnOverSpliced", "WT_3.UnOverSpliced")])
+  WTVec <- sapply(WTVec, log2)
+  ZNF2Vec <- as.numeric(row[c("ZNF2_1.UnOverSpliced", "ZNF2_2.UnOverSpliced", "ZNF2_3.UnOverSpliced")])
+  ZNF2Vec <- sapply(ZNF2Vec, log2)
+  if (sum(is.finite(WTVec)) > 2 & sum(is.finite(ZNF2Vec)) > 2) {
+    tryCatch({
+      tTestResult <- t.test(x = WTVec, y = ZNF2Vec, na.action = NA)
+      if (!is.na(tTestResult$p.value)) {
+        return(tTestResult$p.value)
+      } else {
+        cat("NA p-value for row:\n", row, "\n")
+        return(NA)
+      }
+    }, error = function(e) {
+      cat("Error for row:\n", row, "\n")
+      return(NA)
+    })
+  } else {
+    return(NA)
+  }
+})
+
+#Label ribosomal protein genes
+GeneStart <- sapply(Fulldf$GeneNames, substr, start = 0, stop = 3)
+Fulldf$RibosomalProteinGene <- ((GeneStart == "RPL")|(GeneStart == "RPS"))
+
+#Get Branch points form AresSeq
+Fulldf$BPSeq <- AresSeq[match(Fulldf$GeneNames, AresSeq$gene),"expanded_branch_point"]
+
+#Get 5' and 3' ss
+logoDF <- cbind(Fulldf, GetFiveThreeSS(rownames(Fulldf), 1, downStreamBases = 2))
+
+#Get intron length 
+logoDF$IntronLength <- sapply(rownames(logoDF), getIntronLength)
+
+#Run scan to get cutoff
+#N31_scan <- data.frame(Cutoff = 30:400, pvalues = sapply(30:400, ttest_scan_intron, data = logoDF, variable_ttest = "N31_Over_WT"), NumTSS = sapply(30:400, ttest_scan_intron, data = logoDF, variable_ttest = "N31_Over_WT", ttestoutput = FALSE))
+
+ZNF2_scan <- data.frame(Cutoff = 30:400, pvalues = sapply(30:400, ttest_scan_intron, data = logoDF, variable_ttest = "ZNF2_Over_WT"), NumTSS = sapply(30:400, ttest_scan_intron, data = logoDF, variable_ttest = "ZNF2_Over_WT", ttestoutput = FALSE))
+
+longIntonCutoff <- 363
+
+logoDF$LongIntron <- logoDF$IntronLength > longIntonCutoff
+
+#Get TSS to 5'ss for each gene
+mRNAsGFF <- makeGRangesFromDataFrame(as.data.frame(mRNAGFF), keep.extra.columns = TRUE)
+AresChrFix <- AresIntrons
+AresChrFix$Chr <- mapply(paste, "chr", AresChrFix$Chr, sep = "")
+
+IntronsGFF <- makeGRangesFromDataFrame(AresChrFix,keep.extra.columns = TRUE)
+overlapIntrons <- findOverlapPairs(IntronsGFF, mRNAsGFF)
+
+CapToFivessDistance <- sapply(seq_along(overlapIntrons), getCapToFivessDistance, overlaps = overlapIntrons)
+CapToFiveSSdf <- data.frame(Intron = overlapIntrons@first$GeneID, Captofivess = CapToFivessDistance, Strand = strand(overlapIntrons@first))
+logoDF$TSS_to_FiveSS <- sapply(1:nrow(logoDF), GetCapFiveSSforSplicingData)
+TSSLongThreshold <- 85
+logoDF$long_TSS_to_FiveSS_Dis <- logoDF$TSS_to_FiveSS > TSSLongThreshold
+
+```
+
+Filter Introns
+```{r}
+# Remove all introns where there are no spliced reads in any sample
+plotDF <- logoDF[(is.finite(logoDF$WT_Avg) & is.finite(logoDF$N31_Avg) & is.finite(logoDF$ZNF2_Avg)),]
+```
+
+Ribosomal Proteins Vs Non-Ribosomal Proteins
+```{r}
+# Define a function to create the ribo plots
+create_ribo_plot <- function(data, x_var, y_var, x_label, y_label) {
+	
+  ggplot(data = data) +
+    geom_point(aes(x = {{ x_var }}, y = {{ y_var }}, color = RibosomalProteinGene), alpha = 0.5) +
+    scale_x_continuous(trans = "log2") +
+    scale_y_continuous(trans = trans_reverser('log10')) +
+    xlab(x_label) +
+    ylab(y_label) +
+    theme_bw() +
+    theme(legend.position = "none",plot.title = element_text(size = 10))+
+  	ggtitle(label = "")
+}
+
+# Define a function to t-test the RPG data
+tTest_make_Ribo_plot <- function(data = plotDF, x_var, x_var_plot, title) {
+	Ribo <- na.omit(data[data$RibosomalProteinGene , x_var ] )
+	Ribo <- log2(Ribo)
+	Ribo <- Ribo[is.finite(Ribo)]
+	
+	Non_Ribo <- na.omit(data[!data$RibosomalProteinGene , x_var ] )
+	Non_Ribo <- log2(Non_Ribo)
+	Non_Ribo <- Non_Ribo[is.finite(Non_Ribo)]
+	
+	ttestres <- t.test(Ribo, Non_Ribo)
+	
+	plot <- ggplot(data = data) +
+    geom_boxplot(mapping = aes(x = RibosomalProteinGene, y = {{ x_var_plot }}, fill = RibosomalProteinGene), alpha = 0.5, outlier.shape = NA) +
+    scale_y_continuous(trans = "log2") +
+    xlab("") +
+    ylab(paste("Intronic reads ", title, "/WT", sep = "")) +
+    guides(fill = "none") +
+    ggtitle(label = paste("MD:" ,signif(diff(ttestres$estimate),3), "\np-value:", signif(ttestres$p.value, 3)))+
+		geom_jitter(aes(x = RibosomalProteinGene, y = {{ x_var_plot }}), color="black", size=1, alpha=0.25)+
+  	theme_bw() +
+  	theme(plot.title = element_text(size = 10))
+	
+	return(list(plot, ttestres))
+}
+
+# t-test RPGs
+N31RiboHis <- tTest_make_Ribo_plot(data = plotDF, x_var = "N31_Over_WT", N31_Over_WT, "N31")
+ZNF2RiboHis <- tTest_make_Ribo_plot(data = plotDF, x_var = "ZNF2_Over_WT", ZNF2_Over_WT, "ZNF2")
+
+# Create N31RiboPlot and ZNF2RiboPlot
+N31RiboSE <- create_ribo_plot(plotDF, N31_Over_WT, pval_N31, "Intronic Reads N31/WT", "p-value")
+ZNF2RiboSE <- create_ribo_plot(plotDF, ZNF2_Over_WT, pval_ZNF2, "Intronic Reads ZNF2/WT", "p-value")
+
+# Arrange plots
+N31RiboPlot <- arrangeGrob(N31RiboHis[[1]], N31RiboSE, layout_matrix = rbind(c(1,2,2)))
+ZNF2RiboPlot <- arrangeGrob(ZNF2RiboHis[[1]], ZNF2RiboSE, layout_matrix = rbind(c(1,2,2)))
+
+```
+
+Make TSS to 5' Length Plots
+```{r}
+# Function to make splicing efficeny vs TSS to 5'ss length plot
+plot_TSS_5ss_length_vs_SE <- function(data, variable, pval_col) {
+
+  plot <- ggplot(data = data) +
+    geom_point(mapping = aes(x = TSS_to_FiveSS, y = {{ variable }}, color = {{ pval_col }}), alpha = 0.5) +
+    scale_y_continuous(trans = 'log2') +
+  	scale_x_continuous(trans = 'sqrt')+
+    xlab("TSS to 5'ss length")+
+  	geom_vline(xintercept = TSSLongThreshold)+
+  	theme_bw()+
+  	theme(axis.title.y = element_blank())+
+  	labs(color = "p-value")+
+  	ggtitle(label = "")
+
+  return(plot)
+}
+
+# Function to perform t-test and create a ggplot2 plot histogram
+perform_t_test_and_plot_TSS <- function(data, variable, variable_ttest, title) {
+  longTSSFivess <- data[data$long_TSS_to_FiveSS_Dis,]
+  shortTSSFivess <- data[!data$long_TSS_to_FiveSS_Dis,]
+
+  shortValues <- shortTSSFivess[is.finite(log2(shortTSSFivess[[variable_ttest]])), variable_ttest]
+  longValues <- longTSSFivess[is.finite(log2(longTSSFivess[[variable_ttest]])), variable_ttest]
+  
+  ttest_result <- t.test(x = log2(shortValues), y = log2(longValues))
+
+  dataNarm <- data[!is.na(data$long_TSS_to_FiveSS_Dis),]
+  
+  plot <- ggplot(data = dataNarm) +
+    geom_boxplot(mapping = aes(x = long_TSS_to_FiveSS_Dis, y = {{ variable }}, fill = long_TSS_to_FiveSS_Dis), alpha = 0.5, outlier.shape = NA) +
+    scale_y_continuous(trans = "log2") +
+    xlab(paste("TSS to 5'ss >", TSSLongThreshold, "nts")) +
+    ylab(paste("Intronic reads ", title, "/WT", sep = "")) +
+    guides(fill = "none") +
+    ggtitle(label = paste("MD:" ,signif(diff(ttest_result$estimate),3),"\np-value:", signif(ttest_result$p.value, 3)))+
+  	geom_jitter(aes(x = long_TSS_to_FiveSS_Dis, y = {{ variable }}), color="black", size=1, alpha=0.25)+
+  	scale_fill_brewer(palette = "Set1")+
+  	theme_bw() +
+  	theme(plot.title = element_text(size = 10))
+
+  return(list(plot, ttest_result))
+}
+
+
+# Call the function for N31_Over_WT
+N31His <- perform_t_test_and_plot_TSS(plotDF, N31_Over_WT,"N31_Over_WT", "N31")
+N31SE <- plot_TSS_5ss_length_vs_SE(plotDF, N31_Over_WT, pval_N31)
+N31SE <- N31SE + theme(axis.title.y = element_blank(), legend.position = "none")
+
+
+# Call the function for ZNF2_Over_WT
+ZNF2His <- perform_t_test_and_plot_TSS(plotDF, ZNF2_Over_WT,"ZNF2_Over_WT", "ZNF2")
+ZNF2SE <- plot_TSS_5ss_length_vs_SE(plotDF, ZNF2_Over_WT, pval_ZNF2)
+
+# Arrange and display the plots
+N31TSSLengths <- arrangeGrob(N31His[[1]], N31SE, layout_matrix = rbind(c(1,2,2)))
+Znf2TSSLengths <- arrangeGrob(ZNF2His[[1]], ZNF2SE, layout_matrix = rbind(c(1,2,2)))
+```
+
+SequenceLogo
+```{r}
+#Define a function to create volcano plots for sequence logos
+createVolcanoPlot <- function(data, x_var, y_var, unspliced_col, pval_col,unsplicedThreshold = unsplicedThreshold, pvalThreshold = pvalThreshold, x_label, title) {
+  ggplot(data = data, aes({{ x_var }}, {{ y_var }})) +
+    geom_point(data = subset(data, (data[[pval_col]] < pvalThreshold) & (data[[unspliced_col]] > unsplicedThreshold)), color = '#DB6BC5', alpha = 0.5, size = 3) +
+    geom_point(data = subset(data, (data[[pval_col]] < pvalThreshold) & (data[[unspliced_col]] < unsplicedThreshold)), color = '#35888C', alpha = 0.5, size = 3) +
+    geom_point(alpha = 0.5) +
+    geom_hline(yintercept = pvalThreshold, linetype = 2) +
+    scale_x_continuous(trans = "log2") +
+    scale_y_continuous(trans = trans_reverser('log10')) +
+    xlab(x_label) +
+    ylab("p-value") +
+    ggtitle(title) +
+    theme_bw() +
+    theme(plot.title = element_blank())
+}
+
+# Define a function to create ggseqlogo plots
+createSeqLogoPlot <- function(sequence) {
+  ggseqlogo(sequence) +
+    theme_bw() +
+    theme(
+      plot.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+}
+
+unsplicedThreshold <- 1
+pvalThreshhold <- 0.05
+
+ZNF2Seq <- na.omit(plotDF[plotDF$ZNF2_Over_WT > unsplicedThreshold & plotDF$pval_ZNF2 <  pvalThreshhold,"ExtFiveSSseq"]) 
+
+ZNF2LowSeq <- na.omit(plotDF[plotDF$ZNF2_Over_WT < unsplicedThreshold & plotDF$pval_ZNF2 <  pvalThreshhold,"ExtFiveSSseq"])
+
+N31Seq <- na.omit(plotDF[plotDF$N31_Over_WT > unsplicedThreshold & plotDF$pval_N31 <  pvalThreshhold,"ExtFiveSSseq"])
+
+N31LowSeq <- na.omit(plotDF[plotDF$N31_Over_WT < unsplicedThreshold & plotDF$pval_N31 <  pvalThreshhold,"ExtFiveSSseq"])
+
+ZNF2BPSeq <- na.omit(plotDF[plotDF$ZNF2_Over_WT > unsplicedThreshold & plotDF$pval_ZNF2 <  pvalThreshhold,"BPSeq"])
+
+ZNF2BPSeq <- substr(x = ZNF2BPSeq, start = 2, stop = 13)
+
+ZNF2LowBPSeq <- na.omit(plotDF[plotDF$ZNF2_Over_WT < unsplicedThreshold & plotDF$pval_ZNF2 <  pvalThreshhold,"BPSeq"])
+
+ZNF2LowBPSeq <- substr(x = ZNF2LowBPSeq, start = 2, stop = 13)
+
+N31BPSeq <- na.omit(plotDF[plotDF$N31_Over_WT > unsplicedThreshold & plotDF$pval_N31 <  pvalThreshhold,"BPSeq"])
+
+N31BPSeq <- substr(x = N31BPSeq, start = 2, stop = 13)
+
+N31LowBPSeq <- na.omit(plotDF[plotDF$N31_Over_WT < unsplicedThreshold & plotDF$pval_N31 <  pvalThreshhold,"BPSeq"])
+
+N31LowBPSeq <- substr(x = N31LowBPSeq, start = 2, stop = 13)
+
+AllBPseqlong <- as.vector(na.omit(plotDF[["BPSeq"]]))
+
+AllBPSeq <- substr(x = AllBPseqlong, start = 2, stop = 13)
+
+AllFiveseq <-plotDF["ExtFiveSSseq"]
+
+# Create ggseqlogo plots for different sequences
+ZNF2fiveSS <- createSeqLogoPlot(ZNF2Seq)
+ZNF2LowfiveSS <- createSeqLogoPlot(ZNF2LowSeq)
+N31fiveSS <- createSeqLogoPlot(N31Seq)
+N31LowfiveSS <- createSeqLogoPlot(N31LowSeq)
+ZNF2BP <- createSeqLogoPlot(ZNF2BPSeq)
+ZNF2LowBP <- createSeqLogoPlot(ZNF2LowBPSeq)
+N31BP <- createSeqLogoPlot(N31BPSeq)
+N31LowBP <- createSeqLogoPlot(N31LowBPSeq)
+allBP <- createSeqLogoPlot(AllBPSeq)
+allfiveSS <- createSeqLogoPlot(AllFiveseq)
+
+N31vol <- createVolcanoPlot(
+  data = plotDF,
+  x_var = N31_Over_WT,
+  y_var = pval_N31,
+  pval_col = "pval_N31",
+  unspliced_col = "N31_Over_WT",
+  unsplicedThreshold = unsplicedThreshold,
+  pvalThreshold = pvalThreshhold,
+  x_label = "Intronic reads N31/WT",
+  title = "N31 Volcano Plot"
+)
+
+ZNF2vol <- createVolcanoPlot(
+  data = plotDF,
+  x_var = ZNF2_Over_WT,
+  y_var = pval_ZNF2,
+  pval_col = "pval_ZNF2",
+  unspliced_col = "ZNF2_Over_WT",
+  unsplicedThreshold = unsplicedThreshold,
+  pvalThreshold = pvalThreshhold,
+  x_label = "Intronic reads ZNF2/WT",
+  title = "ZNF2 Volcano Plot"
+)
+
+
+layLogos <- rbind(c(1,NA,3,9),
+									c(1,NA,5,11),
+									c(1,NA,7,13),
+									c(2,NA,4,10),
+									c(2,NA,6,12),
+									c(2,NA,8,14))
+
+N31ZNF2fivess <- arrangeGrob(N31vol, ZNF2vol, N31fiveSS, ZNF2fiveSS, allfiveSS, allfiveSS, N31LowfiveSS, ZNF2LowfiveSS, N31BP,ZNF2BP,allBP,allBP,N31LowBP, ZNF2LowBP,widths=unit(c(14,2,7,7), c("cm")), layout_matrix = layLogos)
+```
+
+Assemble Panels
+```{r}
+#Define the layout of the panel
+layLogos <- rbind(c(5,5),
+									c(NA,NA),
+									c(1,2),
+									c(3,4)
+									)
+#Arrange grob
+Fig4 <- arrangeGrob(N31RiboPlot, ZNF2RiboPlot,N31TSSLengths,Znf2TSSLengths,N31ZNF2fivess, heights=unit(c(15,1,8,8), c("cm")), layout_matrix = layLogos)
+
+#Save image
+ggsave(filename = "./Panels/Fig4.png", device = "png", plot = Fig4, units = "cm", width = 30, height = 32)
+```
+
+##### 
+
+Supplemental Figure 
+
+#####
+
+Make mRNA levels
+```{r}
+#Extract counts dataframe from RDS
+AllCountsDF <- All$counts
+
+#Set p-value cutoff 
+mRNApvalThreshhold <- 1e-5
+
+#Define the volcano plotting function
+create_volcano_plot <- function(data, x_var, y_var, x_label, y_label) {
+  ggplot(data = data) +
+    geom_point(aes(x = {{x_var}}, y = {{y_var}}), alpha = 0.25) +
+    scale_y_continuous(trans = trans_reverser('log10')) +
+    xlab(x_label) +
+    ylab(y_label) +
+    theme_bw() +
+    theme(legend.position = "none") +
+    geom_hline(yintercept = mRNApvalThreshhold, linetype = 2)
+}
+
+#Run DESeq
+coldata <-
+	data.frame(
+		row.names = colnames(AllCountsDF),
+		condition = factor(c("WT", "WT", "WT", "N31", "N31", "N31", "ZNF2", "ZNF2", "ZNF2"))
+	)
+
+dds <- DESeq(DESeqDataSetFromMatrix(countData = AllCountsDF,
+															colData = coldata,
+															design = ~ condition))
+
+WT_N31 <- results(dds, contrast = c("condition", "WT", "N31"))
+
+WT_ZNF2 <- results(dds, contrast = c("condition", "WT", "ZNF2"))
+
+#Plot results
+WT_N31_Volcano <- create_volcano_plot(data.frame(WT_N31), log2FoldChange, pvalue, "log2 FC N31/WT", "p-value")
+WT_ZNF2_Volcano <- create_volcano_plot(data.frame(WT_ZNF2), log2FoldChange, pvalue, "log2 FC ZNF2/WT", "p-value")
+
+mRNAplots <- arrangeGrob(WT_N31_Volcano,WT_ZNF2_Volcano,nrow = 1)
+```
+
+Make 3'ss seq logo
+```{r}
+ZNF2Seq <- na.omit(plotDF[plotDF$ZNF2_Over_WT > unsplicedThreshold & plotDF$pval_ZNF2 <  pvalThreshhold,"threeSSseqExt"]) 
+
+ZNF2LowSeq <- na.omit(plotDF[plotDF$ZNF2_Over_WT < unsplicedThreshold & plotDF$pval_ZNF2 <  pvalThreshhold,"threeSSseqExt"])
+
+N31Seq <- na.omit(plotDF[plotDF$N31_Over_WT > unsplicedThreshold & plotDF$pval_N31 <  pvalThreshhold,"threeSSseqExt"])
+
+N31LowSeq <- na.omit(plotDF[plotDF$N31_Over_WT < unsplicedThreshold & plotDF$pval_N31 <  pvalThreshhold,"threeSSseqExt"])
+
+All_3ssSeq <- na.omit(plotDF["threeSSseqExt"])
+
+ZNF23ssSeq <- createSeqLogoPlot(ZNF2Seq)
+ZNF23ssSeqlow <- createSeqLogoPlot(ZNF2LowSeq)
+N313ssSeq <- createSeqLogoPlot(N31Seq)
+N313ssSeqlow <-createSeqLogoPlot(N31LowSeq)
+All3ss <- createSeqLogoPlot(All_3ssSeq)
+
+layLogos <- rbind(c(1,NA,4),
+									c(1,NA,3),
+									c(1,NA,5),
+									c(2,NA,7),
+									c(2,NA,6),
+									c(2,NA,8))
+
+N31ZNF2threess <- arrangeGrob(N31vol, ZNF2vol, All3ss, N313ssSeq, N313ssSeqlow,All3ss, ZNF23ssSeq, ZNF23ssSeqlow,widths = c(0.4,0.1,0.5), layout_matrix = layLogos)
+```
+
+Make 5'ss histograms
+```{r}
+#Define a function to make a 5'ss sequence histogram
+tTest_SE_by_5SS <- function(fiveSS, data = plotDF, testVariable = "N31_Over_WT", plotVar = N31_Over_WT, ylabel) {
+	testfive_ss_plotdf <- data
+	testfive_ss_plotdf$FiveSSMatch <- data$fiveSSseq == fiveSS
+	
+	testfive_ss_ttest <- testfive_ss_plotdf[testfive_ss_plotdf$FiveSSMatch,testVariable]
+	testfive_ss_SE <- log2(na.omit(testfive_ss_ttest))
+	testfive_ss_SE <- testfive_ss_SE[is.finite(testfive_ss_SE)]
+	
+	otherfive_ss_ttest <- testfive_ss_plotdf[!testfive_ss_plotdf$FiveSSMatch,testVariable]
+	otherfive_ss_SE <- log2(na.omit(otherfive_ss_ttest))
+	otherfive_ss_SE <- otherfive_ss_SE[is.finite(otherfive_ss_SE)]
+	
+	ttestres <- t.test(testfive_ss_SE, otherfive_ss_SE)
+	
+	plot <- ggplot(data = testfive_ss_plotdf)+
+		geom_boxplot(aes(x = FiveSSMatch, y = {{ plotVar }}, fill = FiveSSMatch), alpha = 0.5, outlier.shape = NA)+
+		ggtitle(label = paste("MD:" ,signif(diff(ttestres$estimate),3),"\np-value", signif(ttestres$p.value,3)))+
+		scale_y_continuous(trans = "log")+
+		xlab(label = paste("5'SS:",fiveSS))+
+		ylab(label = ylabel)+
+		geom_jitter(aes(x = FiveSSMatch, y = {{ plotVar }}), color="black", size=2, alpha=0.25)+
+		theme_bw()+
+		theme(legend.position="none",plot.title = element_text(size = 10))
+	
+	return(plot)
+}
+
+# Make 5'ss sequences 
+N31Con5ssPlot <- tTest_SE_by_5SS(fiveSS = "GTATGT",data = plotDF, testVariable = "N31_Over_WT", plotVar = N31_Over_WT, ylabel = "Intron Reads N31 / WT")
+ZNF2C45ssPlot <- tTest_SE_by_5SS(fiveSS = "GTACGT",data = plotDF, testVariable = "ZNF2_Over_WT", plotVar = ZNF2_Over_WT, ylabel = "Intron Reads ZNF2 / WT")
+```
+
+Make Intron Length Histograms
+```{r}
+# Function to make splicing efficeny vs intron length plot
+plot_intron_length_vs_SE <- function(data, variable, pval_col) {
+
+  plot <- ggplot(data = data) +
+    geom_point(mapping = aes(x = IntronLength, y = {{ variable }}, color = {{ pval_col }}, shape = RibosomalProteinGene)) +
+    scale_y_continuous(trans = 'log2') +
+    xlab("Intron length") +
+  	scale_x_continuous(trans = 'sqrt')+
+  	scale_shape(guide = "none")+
+  	geom_vline(xintercept = longIntonCutoff)+
+  	theme_bw()+
+  	theme(axis.title.y = element_blank(),plot.title = element_text(size = 10))+
+  	labs(color = "p-value", shape = "Ribosomal Protein Gene")+
+  	ggtitle(label = "")
+
+  return(plot)
+}
+
+# Function to perform t-test and create a ggplot2 plot histogram
+perform_t_test_and_plot <- function(data, variable, variable_ttest, title) {
+  longIntrons <- data[data$LongIntron,]
+  shortIntrons <- data[!data$LongIntron,]
+
+  longValues <- longIntrons[is.finite(log2(longIntrons[[variable_ttest]])), variable_ttest]
+  shortValues <- shortIntrons[is.finite(log2(shortIntrons[[variable_ttest]])), variable_ttest]
+  
+  ttest_result <- t.test(x = log2(longValues), y = log2(shortValues))
+
+  plot <- ggplot(data = data) +
+    geom_boxplot(mapping = aes(x = LongIntron, y = {{ variable }}, fill = LongIntron), alpha = 0.5, outlier.shape = NA) +
+    scale_y_continuous(trans = "log2") +
+    xlab(paste("Intron Length >", longIntonCutoff, "nts")) +
+  	ylab(paste("Intronic reads ", title, "/WT", sep = ""))+
+    guides(fill = "none") +
+  	geom_jitter(aes(x = LongIntron, y = {{ variable }}), color="black", size=2, alpha=0.25)+
+    ggtitle(label = paste("MD:" ,signif(diff(ttest_result$estimate),3), "\np-value:", signif(ttest_result$p.value, 3)))+
+  	theme_bw()+
+  	theme(plot.title = element_text(size = 10))
+
+  return(list(plot, ttest_result))
+}
+
+# Call the function for N31_Over_WT
+N31His <- perform_t_test_and_plot(plotDF, N31_Over_WT,"N31_Over_WT", "N31")
+N31SE <- plot_intron_length_vs_SE(plotDF, N31_Over_WT, pval_N31)
+
+# Call the function for ZNF2_Over_WT
+ZNF2His <- perform_t_test_and_plot(plotDF, ZNF2_Over_WT,"ZNF2_Over_WT", "ZNF2")
+ZNF2SE <- plot_intron_length_vs_SE(plotDF, ZNF2_Over_WT, pval_ZNF2)
+
+# Arrange and display the plots
+N31IntLengths <- arrangeGrob(N31His[[1]],N31SE, layout_matrix = rbind(c(1,2,2,2)))
+Znf2IntLengths <- arrangeGrob(ZNF2His[[1]],ZNF2SE, layout_matrix = rbind(c(1,2,2,2)))
+
+```
+
+Assemble Panels
+```{r}
+layLogos <- rbind(c(1),
+									c(2),
+									c(3),
+									c(4))
+
+middleRow <- arrangeGrob(N31ZNF2threess,N31Con5ssPlot,ZNF2C45ssPlot, nrow = 1, widths = c(0.6,0.2,0.2))
+
+supplimentalPanel <- arrangeGrob(mRNAplots,middleRow,N31IntLengths, Znf2IntLengths, nrow = 4, heights = c(7,13,6,6))
+
+ggsave(filename = "./Panels/SupplimentalFig1.png", device = "png", plot = supplimentalPanel, units = "cm", width = 30, height = 40)
+```
